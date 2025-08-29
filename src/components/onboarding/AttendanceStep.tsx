@@ -5,7 +5,6 @@ import { cn } from '../../lib/utils';
 import BulkImport from './BulkImport';
 import { useFormCache } from '../../hooks/useFormCache';
 
-
 interface Student {
   student_id: string;
   school_student_id?: string;
@@ -64,43 +63,6 @@ const SCHOOL_YEARS = [
   `${CURRENT_YEAR+1}-${CURRENT_YEAR+2}`
 ];
 
-// Define AVAILABLE_COLUMNS for standard format processing.
-// This is a simplified example; you might have a more comprehensive list in a real app.
-const AVAILABLE_COLUMNS = {
-  attendance: [
-    { dbColumn: 'school_student_id', csvColumn: ['school student id', 'id', 'student id', 'studentid'] },
-    { dbColumn: 'record_date', csvColumn: ['record date', 'result date', 'date'] },
-    { dbColumn: 'total_days_present', csvColumn: ['total days present', 'days present'] },
-    { dbColumn: 'total_days_possible', csvColumn: ['total days possible', 'days possible'] },
-    { dbColumn: 'fy_absences_total', csvColumn: ['fy absences (total days)', 'total absences'] },
-    { dbColumn: 'fy_absences_excused', csvColumn: ['fy absences (excused days)', 'excused absences'] },
-    { dbColumn: 'fy_absences_unexcused', csvColumn: ['fy absences (unexcused days)', 'unexcused absences'] },
-    { dbColumn: 'fy_tardies_total', csvColumn: ['fy tardies (total days)', 'total tardies'] },
-    { dbColumn: 'daily_attendance_rate', csvColumn: ['daily attendance rate'] },
-    { dbColumn: 'mp1_attendance_rate', csvColumn: ['mp1 (daily attendance rate)', 'mp1 attendance rate'] },
-    { dbColumn: 'mp2_attendance_rate', csvColumn: ['mp2 (daily attendance rate)', 'mp2 attendance rate'] },
-    { dbColumn: 'mp3_attendance_rate', csvColumn: ['mp3 (daily attendance rate)', 'mp3 attendance rate'] },
-    { dbColumn: 'mp4_attendance_rate', csvColumn: ['mp4 (daily attendance rate)', 'mp4 attendance rate'] },
-  ]
-};
-
-// Helper function to find best column matches (simplified for this example)
-// In a real application, this would likely be more robust, potentially using fuzzy matching.
-const findBestColumnMatches = (csvHeaders: string[], availableColumns: { dbColumn: string; csvColumn: string[] }[]) => {
-  const matches: { dbColumn: string; csvColumn: string }[] = [];
-  csvHeaders.forEach(csvHeader => {
-    const normalizedCsvHeader = csvHeader.toLowerCase().trim();
-    for (const ac of availableColumns) {
-      if (ac.csvColumn.includes(normalizedCsvHeader)) {
-        matches.push({ dbColumn: ac.dbColumn, csvColumn: csvHeader });
-        break;
-      }
-    }
-  });
-  return matches;
-};
-
-
 export default function AttendanceStep({ data, students, onUpdate, schoolId }: AttendanceStepProps) {
   const [error, setError] = useState<string | null>(null);
   const { data: cachedData, setData: setCachedData } = useFormCache('attendance', data);
@@ -120,95 +82,220 @@ export default function AttendanceStep({ data, students, onUpdate, schoolId }: A
 
   const handleBulkImport = (raw: any[]) => {
     try {
+      console.log('Raw data received:', raw);
+      
       // Check if this is a LinkIt! attendance report format
-      const isLinkItFormat = raw.length > 7 && 
-                             raw[0] && raw[0][0] === "Export Date" && 
-                             raw[2] && raw[2][0] === "District" &&
-                             raw[7] && raw[7][0] === "#";
+      const isLinkItFormat = detectLinkItFormat(raw);
+      console.log('Is LinkIt format:', isLinkItFormat);
 
       if (isLinkItFormat) {
-        // Process as LinkIt! attendance report format
         processLinkItFormat(raw);
       } else {
-        // Process using standard column mapping
         processStandardFormat(raw);
       }
     } catch (e: any) {
+      console.error('Import error:', e);
       setError(`Import failed: ${e.message}`);
     }
   };
 
+  const detectLinkItFormat = (raw: any[]): boolean => {
+    // Check for LinkIt format indicators
+    if (!raw || raw.length < 8) return false;
+
+    // Look for "Export Date" in first row
+    const hasExportDate = raw[0] && 
+      Array.isArray(raw[0]) && 
+      raw[0].some((cell: any) => 
+        cell && String(cell).toLowerCase().includes('export date')
+      );
+
+    // Look for header row with "#" symbol (typically around row 7-8)
+    const hasHeaderRow = raw.some((row, index) => 
+      index >= 6 && index <= 10 && 
+      Array.isArray(row) && 
+      row[0] === "#"
+    );
+
+    // Look for "District" in early rows
+    const hasDistrictInfo = raw.slice(0, 5).some(row => 
+      Array.isArray(row) && 
+      row.some((cell: any) => 
+        cell && String(cell).toLowerCase().includes('district')
+      )
+    );
+
+    console.log('LinkIt detection:', { hasExportDate, hasHeaderRow, hasDistrictInfo });
+    
+    return hasExportDate || hasHeaderRow || hasDistrictInfo;
+  };
+
   const processLinkItFormat = (raw: any[]) => {
-    // Extract attendance year from cell B2
-    let attendanceYearFromFile = watch('attendance_year');
-    if (raw.length > 1 && raw[1] && raw[1][1]) {
-      const yearCell = String(raw[1][1]);
-      const yearMatch = yearCell.match(/(\d{4}-\d{2,4})/);
-      if (yearMatch) {
-        attendanceYearFromFile = yearMatch[1];
+    console.log('Processing LinkIt format');
+    
+    // Find the header row (look for row starting with "#")
+    let headerRowIndex = -1;
+    for (let i = 0; i < Math.min(15, raw.length); i++) {
+      if (raw[i] && Array.isArray(raw[i]) && raw[i][0] === "#") {
+        headerRowIndex = i;
+        break;
       }
+    }
+
+    if (headerRowIndex === -1) {
+      throw new Error('Could not find header row in LinkIt format file. Looking for row starting with "#"');
+    }
+
+    console.log('Found header row at index:', headerRowIndex);
+    const headers = raw[headerRowIndex];
+    console.log('Headers:', headers);
+
+    // Extract attendance year from early rows (typically row 1, column B)
+    let attendanceYearFromFile = watch('attendance_year');
+    for (let i = 0; i < Math.min(5, raw.length); i++) {
+      if (raw[i] && Array.isArray(raw[i]) && raw[i][1]) {
+        const yearCell = String(raw[i][1]);
+        const yearMatch = yearCell.match(/(\d{4}-\d{2,4})/);
+        if (yearMatch) {
+          attendanceYearFromFile = yearMatch[1];
+          console.log('Found attendance year:', attendanceYearFromFile);
+          break;
+        }
+      }
+    }
+
+    // Create column mapping based on known LinkIt structure
+    const columnMap: Record<string, number> = {};
+    headers.forEach((header: any, index: number) => {
+      if (header) {
+        const headerStr = String(header).toLowerCase().trim();
+        columnMap[headerStr] = index;
+      }
+    });
+
+    console.log('Column map:', columnMap);
+
+    // Helper function to find column index by various names
+    const findColumnIndex = (possibleNames: string[]): number => {
+      for (const name of possibleNames) {
+        const index = columnMap[name.toLowerCase()];
+        if (index !== undefined) {
+          return index;
+        }
+      }
+      return -1;
+    };
+
+    // Map required columns with multiple possible names
+    const studentIdIndex = findColumnIndex(['id', 'student id', 'studentid', 'student']);
+    const resultDateIndex = findColumnIndex(['result date', 'date', 'record date']);
+    const totalDaysPresentIndex = findColumnIndex(['total days present', 'days present', 'present']);
+    const totalDaysPossibleIndex = findColumnIndex(['total days possible', 'days possible', 'possible']);
+    const fyAbsencesTotalIndex = findColumnIndex(['fy absences (total days)', 'total absences', 'absences total']);
+    const fyAbsencesExcusedIndex = findColumnIndex(['fy absences (excused days)', 'excused absences', 'excused']);
+    const fyAbsencesUnexcusedIndex = findColumnIndex(['fy absences (unexcused days)', 'unexcused absences', 'unexcused']);
+    const fyTardiesTotalIndex = findColumnIndex(['fy tardies (total days)', 'total tardies', 'tardies']);
+
+    // Optional columns
+    const dailyAttendanceRateIndex = findColumnIndex(['daily attendance rate', 'daily rate']);
+    const mp1AttendanceRateIndex = findColumnIndex(['mp1 (daily attendance rate)', 'mp1 attendance rate', 'mp1 rate']);
+    const mp2AttendanceRateIndex = findColumnIndex(['mp2 (daily attendance rate)', 'mp2 attendance rate', 'mp2 rate']);
+    const mp3AttendanceRateIndex = findColumnIndex(['mp3 (daily attendance rate)', 'mp3 attendance rate', 'mp3 rate']);
+    const mp4AttendanceRateIndex = findColumnIndex(['mp4 (daily attendance rate)', 'mp4 attendance rate', 'mp4 rate']);
+
+    console.log('Column indices:', {
+      studentIdIndex,
+      resultDateIndex,
+      totalDaysPresentIndex,
+      totalDaysPossibleIndex,
+      fyAbsencesTotalIndex,
+      fyAbsencesExcusedIndex,
+      fyAbsencesUnexcusedIndex,
+      fyTardiesTotalIndex
+    });
+
+    // Validate that we found all required columns
+    const missingColumns = [];
+    if (studentIdIndex === -1) missingColumns.push('Student ID');
+    if (resultDateIndex === -1) missingColumns.push('Result Date');
+    if (totalDaysPresentIndex === -1) missingColumns.push('Total Days Present');
+    if (totalDaysPossibleIndex === -1) missingColumns.push('Total Days Possible');
+    if (fyAbsencesTotalIndex === -1) missingColumns.push('FY Absences Total');
+    if (fyAbsencesExcusedIndex === -1) missingColumns.push('FY Absences Excused');
+    if (fyAbsencesUnexcusedIndex === -1) missingColumns.push('FY Absences Unexcused');
+    if (fyTardiesTotalIndex === -1) missingColumns.push('FY Tardies Total');
+
+    if (missingColumns.length > 0) {
+      throw new Error(`Could not find required columns: ${missingColumns.join(', ')}. Available columns: ${headers.join(', ')}`);
     }
 
     const processed: AttendanceRecord[] = [];
     const importErrors: string[] = [];
 
-    // Process each data row (starting from row 8, which is index 7)
-    for (let i = 8; i < raw.length; i++) {
+    // Process each data row (starting after the header)
+    for (let i = headerRowIndex + 1; i < raw.length; i++) {
       const row = raw[i];
       if (!row || !Array.isArray(row) || !row[0]) continue;
 
-      // Get student ID from column C (index 2)
-      const studentId = row[2];
-      if (!studentId) {
+      // Get student ID
+      const studentIdValue = row[studentIdIndex];
+      if (!studentIdValue) {
         importErrors.push(`Row ${i + 1}: Missing student ID`);
         continue;
       }
 
-      // Find student
-      const student = students.find(s => s.school_student_id === String(studentId));
+      // Find student by school_student_id
+      const student = students.find(s => 
+        s.school_student_id === String(studentIdValue).trim()
+      );
+      
       if (!student) {
-        importErrors.push(`Row ${i + 1}: Student with ID ${studentId} not found`);
+        importErrors.push(`Row ${i + 1}: Student with ID ${studentIdValue} not found in students list`);
         continue;
       }
 
-      // Get values from specific columns (matching process_xlsx.py)
-      const resultDate = row[19]; // Column T (Result Date)
-      const totalDaysPresent = row[22]; // Column W (Total Days Present)
-      const totalDaysPossible = row[23]; // Column X (Total Days Possible)
-      const fyAbsencesTotal = row[24]; // Column Y (FY Absences Total)
-      const fyAbsencesExcused = row[25]; // Column Z (FY Absences Excused)
-      const fyAbsencesUnexcused = row[26]; // Column AA (FY Absences Unexcused)
-      const fyTardiesTotal = row[27]; // Column AB (FY Tardies Total)
-      
-      // Get optional rates
-      const dailyAttendanceRate = row[21]; // Column V (Daily Attendance Rate)
-      const mp1AttendanceRate = row[32]; // Column AG (MP1 Daily Attendance Rate)
-      const mp2AttendanceRate = row[43]; // Column AR (MP2 Daily Attendance Rate)
-      const mp3AttendanceRate = row[54]; // Column BC (MP3 Daily Attendance Rate)
-      const mp4AttendanceRate = row[65]; // Column BN (MP4 Daily Attendance Rate)
+      // Get required values
+      const resultDate = row[resultDateIndex];
+      const totalDaysPresent = row[totalDaysPresentIndex];
+      const totalDaysPossible = row[totalDaysPossibleIndex];
+      const fyAbsencesTotal = row[fyAbsencesTotalIndex];
+      const fyAbsencesExcused = row[fyAbsencesExcusedIndex];
+      const fyAbsencesUnexcused = row[fyAbsencesUnexcusedIndex];
+      const fyTardiesTotal = row[fyTardiesTotalIndex];
 
       // Validate required fields
-      if (!resultDate || !totalDaysPresent || !totalDaysPossible ||
-          !fyAbsencesTotal || !fyAbsencesExcused || !fyAbsencesUnexcused || !fyTardiesTotal) {
+      if (!resultDate || totalDaysPresent === null || totalDaysPresent === undefined ||
+          totalDaysPossible === null || totalDaysPossible === undefined ||
+          fyAbsencesTotal === null || fyAbsencesTotal === undefined ||
+          fyAbsencesExcused === null || fyAbsencesExcused === undefined ||
+          fyAbsencesUnexcused === null || fyAbsencesUnexcused === undefined ||
+          fyTardiesTotal === null || fyTardiesTotal === undefined) {
         importErrors.push(`Row ${i + 1}: Missing required attendance data`);
         continue;
       }
 
+      // Get optional values
+      const dailyAttendanceRate = dailyAttendanceRateIndex !== -1 ? row[dailyAttendanceRateIndex] : null;
+      const mp1AttendanceRate = mp1AttendanceRateIndex !== -1 ? row[mp1AttendanceRateIndex] : null;
+      const mp2AttendanceRate = mp2AttendanceRateIndex !== -1 ? row[mp2AttendanceRateIndex] : null;
+      const mp3AttendanceRate = mp3AttendanceRateIndex !== -1 ? row[mp3AttendanceRateIndex] : null;
+      const mp4AttendanceRate = mp4AttendanceRateIndex !== -1 ? row[mp4AttendanceRateIndex] : null;
+
       // Prepare extra data
       const extraData: any = {};
-      if (dailyAttendanceRate !== null && dailyAttendanceRate !== undefined) {
+      if (dailyAttendanceRate !== null && dailyAttendanceRate !== undefined && !isNaN(Number(dailyAttendanceRate))) {
         extraData.daily_attendance_rate = Number(dailyAttendanceRate);
       }
-      if (mp1AttendanceRate !== null && mp1AttendanceRate !== undefined) {
+      if (mp1AttendanceRate !== null && mp1AttendanceRate !== undefined && !isNaN(Number(mp1AttendanceRate))) {
         extraData.mp1_attendance_rate = Number(mp1AttendanceRate);
       }
-      if (mp2AttendanceRate !== null && mp2AttendanceRate !== undefined) {
+      if (mp2AttendanceRate !== null && mp2AttendanceRate !== undefined && !isNaN(Number(mp2AttendanceRate))) {
         extraData.mp2_attendance_rate = Number(mp2AttendanceRate);
       }
-      if (mp3AttendanceRate !== null && mp3AttendanceRate !== undefined) {
+      if (mp3AttendanceRate !== null && mp3AttendanceRate !== undefined && !isNaN(Number(mp3AttendanceRate))) {
         extraData.mp3_attendance_rate = Number(mp3AttendanceRate);
       }
-      if (mp4AttendanceRate !== null && mp4AttendanceRate !== undefined) {
+      if (mp4AttendanceRate !== null && mp4AttendanceRate !== undefined && !isNaN(Number(mp4AttendanceRate))) {
         extraData.mp4_attendance_rate = Number(mp4AttendanceRate);
       }
 
@@ -263,185 +350,121 @@ export default function AttendanceStep({ data, students, onUpdate, schoolId }: A
   };
 
   const processStandardFormat = (raw: any[]) => {
-    // Find the header row (existing logic)
-    let headerRowIndex = -1;
-    for (let i = 0; i < Math.min(10, raw.length); i++) {
-      if (raw[i] && raw[i][0] === "#") {
-        headerRowIndex = i;
-        break;
-      }
-    }
+    console.log('Processing standard format');
     
-    // Alternative detection for attendance report format
-    if (headerRowIndex === -1) {
-      for (let i = 0; i < Math.min(10, raw.length); i++) {
-        if (raw[i] && raw[i].length > 20 && 
-            String(raw[i][2]).toLowerCase().includes('id') && 
-            String(raw[i][19]).toLowerCase().includes('result date')) {
-          headerRowIndex = i;
-          break;
-        }
-      }
-    }
-    
-    if (headerRowIndex === -1) {
-      setError('Could not locate header row (looking for column "#" or attendance format)');
-      return;
+    // For standard CSV format, assume first row is headers
+    if (!raw || raw.length < 2) {
+      throw new Error('File must contain at least a header row and one data row');
     }
 
-    const headers: string[] = raw[headerRowIndex] || [];
-    if (!headers.length) {
-      setError('Could not locate header row.');
-      return;
+    const headers = raw[0];
+    if (!Array.isArray(headers)) {
+      throw new Error('Invalid file format: headers not found');
     }
 
-    // Extract attendance year from cell B2 if available
-    let attendanceYearFromFile = watch('attendance_year');
-    if (raw.length > 1 && raw[1] && raw[1][1]) {
-      const yearCell = String(raw[1][1]);
-      const yearMatch = yearCell.match(/(\d{4}-\d{2,4})/);
-      if (yearMatch) {
-        attendanceYearFromFile = yearMatch[1];
-      }
-    }
+    console.log('Standard format headers:', headers);
 
-    // Use column matcher to find best matches
-    const columnMatches = findBestColumnMatches(headers, AVAILABLE_COLUMNS.attendance);
+    // Create column mapping
     const columnMap: Record<string, number> = {};
-    
-    headers.forEach((header, index) => {
+    headers.forEach((header: any, index: number) => {
       if (header) {
-        columnMap[header.trim().toLowerCase()] = index;
+        const headerStr = String(header).toLowerCase().trim();
+        columnMap[headerStr] = index;
       }
     });
 
-    // Helper function to get value from a row by column name
-    const getValue = (row: any[], columnName: string): any => {
-      // First try exact match
-      const normalizedColumnName = columnName.toLowerCase();
-      if (columnMap[normalizedColumnName] !== undefined) {
-        return row[columnMap[normalizedColumnName]];
+    // Helper function to find column index
+    const findColumnIndex = (possibleNames: string[]): number => {
+      for (const name of possibleNames) {
+        const index = columnMap[name.toLowerCase()];
+        if (index !== undefined) {
+          return index;
+        }
       }
-      
-      // Then try to find best match
-      const bestMatch = columnMatches.find(m => m.dbColumn === columnName);
-      if (bestMatch && columnMap[bestMatch.csvColumn.toLowerCase()] !== undefined) {
-        return row[columnMap[bestMatch.csvColumn.toLowerCase()]];
-      }
-      
-      return null;
+      return -1;
     };
+
+    // Map columns
+    const studentIdIndex = findColumnIndex(['school_student_id', 'student_id', 'id', 'student id', 'studentid']);
+    const resultDateIndex = findColumnIndex(['record_date', 'result_date', 'date', 'result date']);
+    const totalDaysPresentIndex = findColumnIndex(['total_days_present', 'days_present', 'total days present', 'days present']);
+    const totalDaysPossibleIndex = findColumnIndex(['total_days_possible', 'days_possible', 'total days possible', 'days possible']);
+    const fyAbsencesTotalIndex = findColumnIndex(['fy_absences_total', 'absences_total', 'total_absences', 'fy absences total', 'total absences']);
+    const fyAbsencesExcusedIndex = findColumnIndex(['fy_absences_excused', 'absences_excused', 'excused_absences', 'fy absences excused', 'excused absences']);
+    const fyAbsencesUnexcusedIndex = findColumnIndex(['fy_absences_unexcused', 'absences_unexcused', 'unexcused_absences', 'fy absences unexcused', 'unexcused absences']);
+    const fyTardiesTotalIndex = findColumnIndex(['fy_tardies_total', 'tardies_total', 'total_tardies', 'fy tardies total', 'total tardies', 'tardies']);
+
+    // Validate required columns
+    const missingColumns = [];
+    if (studentIdIndex === -1) missingColumns.push('Student ID');
+    if (resultDateIndex === -1) missingColumns.push('Record Date');
+    if (totalDaysPresentIndex === -1) missingColumns.push('Total Days Present');
+    if (totalDaysPossibleIndex === -1) missingColumns.push('Total Days Possible');
+    if (fyAbsencesTotalIndex === -1) missingColumns.push('FY Absences Total');
+    if (fyAbsencesExcusedIndex === -1) missingColumns.push('FY Absences Excused');
+    if (fyAbsencesUnexcusedIndex === -1) missingColumns.push('FY Absences Unexcused');
+    if (fyTardiesTotalIndex === -1) missingColumns.push('FY Tardies Total');
+
+    if (missingColumns.length > 0) {
+      throw new Error(`Could not find required columns: ${missingColumns.join(', ')}. Available columns: ${headers.join(', ')}`);
+    }
 
     const processed: AttendanceRecord[] = [];
     const importErrors: string[] = [];
 
-    // Process each data row (starting after the header)
-    for (let i = headerRowIndex + 1; i < raw.length; i++) {
+    // Process data rows (starting from row 1)
+    for (let i = 1; i < raw.length; i++) {
       const row = raw[i];
-      if (!row || !Array.isArray(row) || !row[0]) continue;
+      if (!row || !Array.isArray(row)) continue;
 
-      // Get student ID using different possible column names
-      let studentId = getValue(row, "school_student_id") || 
-                     getValue(row, "ID") || 
-                     getValue(row, "Student ID") || 
-                     getValue(row, "StudentID");
-      
-      if (!studentId) {
+      const studentIdValue = row[studentIdIndex];
+      if (!studentIdValue) {
         importErrors.push(`Row ${i + 1}: Missing student ID`);
         continue;
       }
 
       // Find student
-      const student = students.find(s => s.school_student_id === String(studentId));
+      const student = students.find(s => 
+        s.school_student_id === String(studentIdValue).trim()
+      );
+      
       if (!student) {
-        importErrors.push(`Row ${i + 1}: Student with ID ${studentId} not found`);
+        importErrors.push(`Row ${i + 1}: Student with ID ${studentIdValue} not found`);
         continue;
       }
 
-      // Get required values using different possible column names
-      const resultDate = getValue(row, "record_date") || 
-                         getValue(row, "Result Date") || 
-                         getValue(row, "Date");
-      
-      const totalDaysPresent = getValue(row, "total_days_present") || 
-                             getValue(row, "Total Days Present") || 
-                             getValue(row, "Days Present");
-      
-      const totalDaysPossible = getValue(row, "total_days_possible") || 
-                               getValue(row, "Total Days Possible") || 
-                               getValue(row, "Days Possible");
-      
-      const fyAbsencesTotal = getValue(row, "fy_absences_total") || 
-                             getValue(row, "FY Absences (Total Days)") || 
-                             getValue(row, "Total Absences");
-      
-      const fyAbsencesExcused = getValue(row, "fy_absences_excused") || 
-                               getValue(row, "FY Absences (Excused Days)") || 
-                               getValue(row, "Excused Absences");
-      
-      const fyAbsencesUnexcused = getValue(row, "fy_absences_unexcused") || 
-                                 getValue(row, "FY Absences (Unexcused Days)") || 
-                                 getValue(row, "Unexcused Absences");
-      
-      const fyTardiesTotal = getValue(row, "fy_tardies_total") || 
-                             getValue(row, "FY Tardies (Total Days)") || 
-                             getValue(row, "Total Tardies");
+      // Get values
+      const resultDate = row[resultDateIndex];
+      const totalDaysPresent = row[totalDaysPresentIndex];
+      const totalDaysPossible = row[totalDaysPossibleIndex];
+      const fyAbsencesTotal = row[fyAbsencesTotalIndex];
+      const fyAbsencesExcused = row[fyAbsencesExcusedIndex];
+      const fyAbsencesUnexcused = row[fyAbsencesUnexcusedIndex];
+      const fyTardiesTotal = row[fyTardiesTotalIndex];
 
       // Validate required fields
-      if (!resultDate || !totalDaysPresent || !totalDaysPossible ||
-          !fyAbsencesTotal || !fyAbsencesExcused || !fyAbsencesUnexcused || !fyTardiesTotal) {
+      if (!resultDate || totalDaysPresent === null || totalDaysPresent === undefined ||
+          totalDaysPossible === null || totalDaysPossible === undefined ||
+          fyAbsencesTotal === null || fyAbsencesTotal === undefined ||
+          fyAbsencesExcused === null || fyAbsencesExcused === undefined ||
+          fyAbsencesUnexcused === null || fyAbsencesUnexcused === undefined ||
+          fyTardiesTotal === null || fyTardiesTotal === undefined) {
         importErrors.push(`Row ${i + 1}: Missing required attendance data`);
         continue;
       }
 
-      // Get optional values
-      const dailyAttendanceRate = getValue(row, "daily_attendance_rate") || 
-                                  getValue(row, "Daily Attendance Rate");
-      
-      const mp1AttendanceRate = getValue(row, "mp1_attendance_rate") || 
-                              getValue(row, "MP1 (Daily Attendance Rate)");
-      
-      const mp2AttendanceRate = getValue(row, "mp2_attendance_rate") || 
-                              getValue(row, "MP2 (Daily Attendance Rate)");
-      
-      const mp3AttendanceRate = getValue(row, "mp3_attendance_rate") || 
-                              getValue(row, "MP3 (Daily Attendance Rate)");
-      
-      const mp4AttendanceRate = getValue(row, "mp4_attendance_rate") || 
-                              getValue(row, "MP4 (Daily Attendance Rate)");
-
-      // Prepare extra data
-      const extraData: any = {};
-      if (dailyAttendanceRate !== null && dailyAttendanceRate !== undefined) {
-        extraData.daily_attendance_rate = Number(dailyAttendanceRate);
-      }
-      if (mp1AttendanceRate !== null && mp1AttendanceRate !== undefined) {
-        extraData.mp1_attendance_rate = Number(mp1AttendanceRate);
-      }
-      if (mp2AttendanceRate !== null && mp2AttendanceRate !== undefined) {
-        extraData.mp2_attendance_rate = Number(mp2AttendanceRate);
-      }
-      if (mp3AttendanceRate !== null && mp3AttendanceRate !== undefined) {
-        extraData.mp3_attendance_rate = Number(mp3AttendanceRate);
-      }
-      if (mp4AttendanceRate !== null && mp4AttendanceRate !== undefined) {
-        extraData.mp4_attendance_rate = Number(mp4AttendanceRate);
-      }
-
-      // Parse date (handle different formats)
+      // Parse date
       let recordDate;
       try {
-        // Try to parse as Date object first
         const dateObj = new Date(resultDate);
         if (!isNaN(dateObj.getTime())) {
           recordDate = dateObj.toISOString().split('T')[0];
         } else {
-          // Try to parse as string in format "MM/DD/YYYY" or "YYYY-MM-DD"
           const dateParts = String(resultDate).split(/[\/\-]/);
           if (dateParts.length === 3) {
-            if (dateParts[0].length === 4) { // YYYY-MM-DD format
+            if (dateParts[0].length === 4) {
               recordDate = `${dateParts[0]}-${dateParts[1].padStart(2, '0')}-${dateParts[2].padStart(2, '0')}`;
-            } else { // MM/DD/YYYY format
+            } else {
               recordDate = `${dateParts[2]}-${dateParts[0].padStart(2, '0')}-${dateParts[1].padStart(2, '0')}`;
             }
           } else {
@@ -464,8 +487,7 @@ export default function AttendanceStep({ data, students, onUpdate, schoolId }: A
         fy_absences_excused: Number(fyAbsencesExcused),
         fy_absences_unexcused: Number(fyAbsencesUnexcused),
         fy_tardies_total: Number(fyTardiesTotal),
-        attendance_year: attendanceYearFromFile,
-        extra_data: Object.keys(extraData).length > 0 ? extraData : undefined
+        attendance_year: attendanceYearFromFile
       });
     }
 
@@ -588,6 +610,31 @@ export default function AttendanceStep({ data, students, onUpdate, schoolId }: A
         <h2 className="text-lg font-semibold text-gray-900">Attendance Records</h2>
       </div>
 
+      {/* LinkIt Format Info */}
+      <div className="bg-blue-50 rounded-lg border border-blue-200 p-6">
+        <div className="flex items-start gap-3">
+          <div className="p-1 bg-blue-100 rounded-full">
+            <AlertCircle className="h-5 w-5 text-blue-600" />
+          </div>
+          <div>
+            <h3 className="text-sm font-medium text-blue-800 mb-2">LinkIt Format Support</h3>
+            <p className="text-sm text-blue-700 mb-2">
+              This step automatically detects and processes LinkIt attendance report files. The system will:
+            </p>
+            <ul className="list-disc pl-5 text-sm text-blue-700 space-y-1">
+              <li>Automatically find the header row (marked with "#")</li>
+              <li>Extract attendance year from the file metadata</li>
+              <li>Map columns based on LinkIt's standard column names</li>
+              <li>Match students using their School Student ID</li>
+              <li>Process all attendance data including marking period rates</li>
+            </ul>
+            <p className="text-sm text-blue-700 mt-2">
+              <strong>Important:</strong> Make sure students are added in the Students step first, as the system matches attendance records using School Student IDs.
+            </p>
+          </div>
+        </div>
+      </div>
+
       {/* Field Requirements Info */}
       <div className="bg-white rounded-lg border border-gray-200 p-6">
         <h3 className="text-sm font-medium text-gray-900 mb-4">Field Requirements</h3>
@@ -598,7 +645,7 @@ export default function AttendanceStep({ data, students, onUpdate, schoolId }: A
               Required Fields
             </h4>
             <ul className="space-y-1 text-sm text-gray-600">
-              <li>• School Student ID</li>
+              <li>• School Student ID (must match existing students)</li>
               <li>• Record Date</li>
               <li>• Total Days Present</li>
               <li>• Total Days Possible</li>
@@ -650,7 +697,7 @@ export default function AttendanceStep({ data, students, onUpdate, schoolId }: A
             mp3_attendance_rate: 96.8,
             mp4_attendance_rate: 99.2
           }}
-          description="Upload a CSV or Excel file containing attendance records. The system will automatically map common column names like 'Student ID', 'Days Present', 'Total Absences', etc. Student ID must match existing students from the Students step."
+          description="Upload a CSV or Excel file containing attendance records. The system automatically detects LinkIt format files and maps columns accordingly. For standard CSV files, ensure column names match the template. Student IDs must match existing students from the Students step."
         />
       </div>
 
@@ -992,7 +1039,7 @@ export default function AttendanceStep({ data, students, onUpdate, schoolId }: A
           {error && (
             <div className="p-4 bg-red-50 rounded-md flex items-center gap-2">
               <AlertCircle className="h-5 w-5 text-red-500 flex-shrink-0" />
-              <p className="text-sm text-red-600">{error}</p>
+              <p className="text-sm text-red-600 whitespace-pre-line">{error}</p>
             </div>
           )}
 
