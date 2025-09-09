@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
 import { useForm } from 'react-hook-form';
-import { Users, Plus, Trash2, Mail, GraduationCap, UserPlus, Heart, AlertCircle, BookOpen } from 'lucide-react';
+import { Users, Plus, Trash2, Mail, GraduationCap, UserPlus, Heart, AlertCircle, BookOpen, CheckCircle } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import BulkImport from './BulkImport';
 import { useFormCache } from '../../hooks/useFormCache';
+import { supabase } from '../../lib/supabase';
+import { nanoid } from 'nanoid';
 
 interface Student {
   student_id: string;
@@ -60,6 +62,7 @@ interface CombinedStepProps {
   needsData: IndividualizedNeed[];
   onStudentsUpdate: (data: Student[]) => void;
   onNeedsUpdate: (data: IndividualizedNeed[]) => void;
+  schoolId?: string;
 }
 
 interface StudentFormData {
@@ -114,8 +117,52 @@ const LANGUAGES = [
   'Arabic', 'Portuguese', 'Russian', 'Japanese', 'Korean', 'Vietnamese', 'Tagalog', 'Hindi', 'Other'
 ];
 
-export default function CombinedStudentsStep({ studentData, needsData, onStudentsUpdate, onNeedsUpdate }: CombinedStepProps) {
+// CSV column mapping for the provided file format
+const CSV_COLUMN_MAPPING = {
+  'Student ID': 'school_student_id',
+  'Last Name': 'last_name',
+  'First Name': 'first_name',
+  'Student Email': 'email',
+  'Grade': 'grade_level',
+  'Address 1': 'street_address',
+  'City': 'city',
+  'State': 'state',
+  'Zip': 'zip',
+  'Gender': 'gender',
+  'Enrollment': 'academic_status',
+  'Guardian 1 Email Address': 'guardian1_email',
+  'Guardian 2 Email Address': 'guardian2_email'
+};
+
+// Grade level mapping for CSV values
+const GRADE_MAPPING = {
+  'KF': 'KG',  // Kindergarten Full-day
+  '01': '1',
+  '02': '2',
+  '03': '3',
+  '04': '4',
+  '05': '5',
+  '06': '6',
+  '07': '7',
+  '08': '8',
+  '09': '9',
+  '10': '10',
+  '11': '11',
+  '12': '12',
+  '3F': '3',   // 3rd grade full-day
+  '4F': '4'    // 4th grade full-day
+};
+
+export default function CombinedStudentsStep({ 
+  studentData, 
+  needsData, 
+  onStudentsUpdate, 
+  onNeedsUpdate,
+  schoolId 
+}: CombinedStepProps) {
   const [error, setError] = useState<string | null>(null);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
   const [showGuardian2, setShowGuardian2] = useState(false);
   const [showIndividualizedNeeds, setShowIndividualizedNeeds] = useState(false);
 
@@ -132,247 +179,453 @@ export default function CombinedStudentsStep({ studentData, needsData, onStudent
     }
   });
 
-  const handleBulkImport = (importedData: Record<string, unknown>[]) => {
-    try {
-      // Validate email format
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-      const invalidEmails = importedData.filter(row => !emailRegex.test(String(row.email || '')));
-      if (invalidEmails.length > 0) {
-        setError(`Invalid email format found in rows: ${invalidEmails.map(row => row.email).join(', ')}`);
-        return;
+  const transformCSVData = (csvRow: Record<string, unknown>) => {
+    // Map CSV columns to database fields
+    const mappedData: Record<string, unknown> = {};
+    
+    Object.entries(CSV_COLUMN_MAPPING).forEach(([csvColumn, dbField]) => {
+      const value = csvRow[csvColumn];
+      if (value !== undefined && value !== null && value !== '') {
+        mappedData[dbField] = value;
       }
+    });
 
-      // Check for duplicate emails
-      const existingEmails = new Set(cachedStudentData.map(student => student.email));
-      const duplicateEmails = importedData.filter(row => existingEmails.has(String(row.email || '')));
-      if (duplicateEmails.length > 0) {
-        setError(`Duplicate emails found: ${duplicateEmails.map(row => row.email).join(', ')}`);
-        return;
-      }
-
-      // Transform imported data
-      const newStudents: Student[] = [];
-      const newNeeds: IndividualizedNeed[] = [];
-
-      importedData.forEach(row => {
-        // Create student
-        const student: Student = {
-          student_id: '', // Will be set by backend
-          school_student_id: row.school_student_id as string,
-          first_name: String(row.first_name),
-          last_name: String(row.last_name),
-          email: String(row.email),
-          user_type: 'student',
-          dob: row.dob as string,
-          enrollment_date: row.enrollment_date as string,
-          graduation_year: row.graduation_year as number,
-          current_gpa: row.current_gpa as number,
-          academic_status: (row.academic_status as string) || 'active',
-          grade_level: (row.grade_level as string) || (row.grade as string) || 'Ungraded',
-          gender: row.gender as string,
-          ethnicity: row.ethnicity as string,
-          state_id: row.state_id as string,
-          // Address fields for users table
-          street_address: row.street_address as string,
-          city: row.city as string,
-          state: row.state as string,
-          zip: row.zip as string,
-          phone: row.phone as string,
-          // Guardian information
-          guardian1_name: row.guardian1_name as string,
-          guardian1_email: row.guardian1_email as string,
-          guardian1_relationship: row.guardian1_relationship as string,
-          guardian2_name: row.guardian2_name as string,
-          guardian2_email: row.guardian2_email as string,
-          guardian2_relationship: row.guardian2_relationship as string,
-          has_iep: row.has_iep === true || row.iep === 'Y' || row.iep === 'Yes',
-          is_economically_disadvantaged: row.is_economically_disadvantaged === true || row.economically_disadvantaged === 'Y' || row.economically_disadvantaged === 'Yes',
-          individualized_notes: row.individualized_notes as string
-        };
-
-        newStudents.push(student);
-
-        // Create individualized needs if applicable
-        if (row.has_iep || row.iep === 'Y' || row.iep === 'Yes') {
-          const iepNeed: IndividualizedNeed = {
-            need_id: '',
-            student_id: '', // Will be linked after student creation
-            type: 'Special Education',
-            details: {
-              status: 'Active',
-              spec_ed_status: row.spec_ed_status as string,
-              spec_ed: row.spec_ed as string,
-              has_active_iep: true,
-              additional_notes: row.individualized_notes as string
-            }
-          };
-          newNeeds.push(iepNeed);
-        }
-
-        if (row.is_economically_disadvantaged || row.economically_disadvantaged === 'Y' || row.economically_disadvantaged === 'Yes') {
-          const economicNeed: IndividualizedNeed = {
-            need_id: '',
-            student_id: '', // Will be linked after student creation
-            type: 'Economically Disadvantaged',
-            details: {
-              status: 'Active',
-              additional_notes: row.individualized_notes as string
-            }
-          };
-          newNeeds.push(economicNeed);
-        }
-      });
-
-      const updatedStudentData = [...cachedStudentData, ...newStudents];
-      const updatedNeedsData = [...cachedNeedsData, ...newNeeds];
-      
-      onStudentsUpdate(updatedStudentData);
-      onNeedsUpdate(updatedNeedsData);
-      setCachedStudentData(updatedStudentData);
-      setCachedNeedsData(updatedNeedsData);
-      setError(null);
-    } catch (err: unknown) {
-      setError(`Failed to import data: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    // Transform grade level
+    if (mappedData.grade_level) {
+      const csvGrade = String(mappedData.grade_level).trim();
+      mappedData.grade_level = GRADE_MAPPING[csvGrade] || csvGrade;
     }
+
+    // Transform gender
+    if (mappedData.gender) {
+      const gender = String(mappedData.gender).toUpperCase();
+      mappedData.gender = gender === 'M' ? 'male' : gender === 'F' ? 'female' : mappedData.gender;
+    }
+
+    // Transform academic status
+    if (mappedData.academic_status) {
+      const status = String(mappedData.academic_status).toLowerCase();
+      mappedData.academic_status = status === 'active' ? 'active' : 'inactive';
+    }
+
+    // Set default enrollment date if not provided
+    if (!mappedData.enrollment_date) {
+      mappedData.enrollment_date = new Date().toISOString().split('T')[0];
+    }
+
+    return mappedData;
   };
 
-  const onSubmit = (formData: StudentFormData) => {
-    // Validate email format
-    const emailRegex = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
-    if (!emailRegex.test(formData.email)) {
-      setError('Invalid email format');
-      return;
-    }
-
-    // Check for duplicate email
-    if (cachedStudentData.some(student => student.email === formData.email)) {
-      setError('A student with this email already exists');
-      return;
-    }
-
-    // Check for duplicate school student ID if provided
-    if (formData.school_student_id && 
-        cachedStudentData.some(student => student.school_student_id === formData.school_student_id)) {
-      setError('A student with this school ID already exists');
-      return;
-    }
-
-    // Validate guardian email format if provided
-    if (formData.guardian1_email && !emailRegex.test(formData.guardian1_email)) {
-      setError('Invalid guardian 1 email format');
-      return;
-    }
-    if (formData.guardian2_email && !emailRegex.test(formData.guardian2_email)) {
-      setError('Invalid guardian 2 email format');
-      return;
-    }
-
-    // Create student
-    const newStudent: Student = {
-      student_id: '', // Will be set by backend
-      school_student_id: formData.school_student_id,
-      first_name: formData.first_name,
-      last_name: formData.last_name,
-      email: formData.email,
-      user_type: 'student',
-      dob: formData.dob,
-      enrollment_date: formData.enrollment_date,
-      graduation_year: formData.graduation_year,
-      current_gpa: formData.current_gpa,
-      academic_status: formData.academic_status,
-      grade_level: formData.grade_level,
-      gender: formData.gender,
-      ethnicity: formData.ethnicity,
-      state_id: formData.state_id,
-      // Address fields
-      street_address: formData.street_address,
-      city: formData.city,
-      state: formData.state,
-      zip: formData.zip,
-      phone: formData.phone,
-      // Guardian information
-      guardian1_name: formData.guardian1_name,
-      guardian1_email: formData.guardian1_email,
-      guardian1_relationship: formData.guardian1_relationship,
-      guardian2_name: formData.guardian2_name,
-      guardian2_email: formData.guardian2_email,
-      guardian2_relationship: formData.guardian2_relationship,
-      has_iep: formData.has_iep,
-      is_economically_disadvantaged: formData.is_economically_disadvantaged,
-      individualized_notes: formData.individualized_notes
+  const createUserRecord = async (studentData: Record<string, unknown>) => {
+    const userRecord = {
+      email: studentData.email as string,
+      first_name: studentData.first_name as string,
+      last_name: studentData.last_name as string,
+      phone: studentData.phone as string || null,
+      street_address: studentData.street_address as string || null,
+      city: studentData.city as string || null,
+      state: studentData.state as string || null,
+      zip: studentData.zip as string || null,
+      country: 'USA',
+      user_type: 'student' as const
     };
 
-    // Create individualized needs if applicable
-    const newNeeds: IndividualizedNeed[] = [];
-    
-    if (formData.has_iep) {
-      const iepNeed: IndividualizedNeed = {
-        need_id: '', // Will be set by backend
-        student_id: '', // Will be linked after student creation
-        type: 'Special Education',
-        details: {
-          status: formData.spec_ed_status,
-          spec_ed_status: formData.spec_ed_status,
-          spec_ed: formData.spec_ed,
-          home_language: formData.home_language,
-          has_active_iep: formData.has_active_iep,
-          ell_active: formData.ell_active,
-          additional_notes: formData.individualized_notes
-        }
-      };
-      newNeeds.push(iepNeed);
+    const { data, error } = await supabase
+      .from('users')
+      .insert(userRecord)
+      .select('id')
+      .single();
+
+    if (error) {
+      throw new Error(`Failed to create user record: ${error.message}`);
     }
 
-    if (formData.is_economically_disadvantaged) {
-      const economicNeed: IndividualizedNeed = {
-        need_id: '', // Will be set by backend
-        student_id: '', // Will be linked after student creation
-        type: 'Economically Disadvantaged',
-        details: {
-          status: 'Active',
-          additional_notes: formData.individualized_notes
-        }
-      };
-      newNeeds.push(economicNeed);
+    return data.id;
+  };
+
+  const createStudentRecord = async (userId: string, studentData: Record<string, unknown>) => {
+    const studentRecord = {
+      student_id: userId,
+      school_student_id: studentData.school_student_id as string || null,
+      first_name: studentData.first_name as string,
+      last_name: studentData.last_name as string,
+      dob: studentData.dob as string || null,
+      enrollment_date: studentData.enrollment_date as string || null,
+      graduation_year: studentData.graduation_year as number || null,
+      current_gpa: studentData.current_gpa as number || null,
+      academic_status: studentData.academic_status as string || 'active',
+      grade_level: studentData.grade_level as string,
+      gender: studentData.gender as string || null,
+      ethnicity: studentData.ethnicity as string || null,
+      state_id: studentData.state_id as string || null,
+      school_id: schoolId || null,
+      guardian1_name: studentData.guardian1_name as string || null,
+      guardian1_email: studentData.guardian1_email as string || null,
+      guardian1_relationship: studentData.guardian1_relationship as string || null,
+      guardian2_name: studentData.guardian2_name as string || null,
+      guardian2_email: studentData.guardian2_email as string || null,
+      guardian2_relationship: studentData.guardian2_relationship as string || null,
+      special_needs: studentData.special_needs || {},
+      created_by: (await supabase.auth.getUser()).data.user?.id || null
+    };
+
+    const { error } = await supabase
+      .from('students')
+      .insert(studentRecord);
+
+    if (error) {
+      throw new Error(`Failed to create student record: ${error.message}`);
     }
 
-    const updatedStudentData = [...cachedStudentData, newStudent];
-    const updatedNeedsData = [...cachedNeedsData, ...newNeeds];
-    
-    onStudentsUpdate(updatedStudentData);
-    onNeedsUpdate(updatedNeedsData);
-    setCachedStudentData(updatedStudentData);
-    setCachedNeedsData(updatedNeedsData);
-    
-    reset({
-      enrollment_date: new Date().toISOString().split('T')[0],
-      academic_status: 'active',
-      grade_level: 'Ungraded',
-      home_language: 'English'
-    });
-    
+    return userId;
+  };
+
+  const createIndividualizedNeed = async (studentId: string, needData: {
+    type: string;
+    details: Record<string, unknown>;
+  }) => {
+    const needRecord = {
+      student_id: studentId,
+      type: needData.type,
+      details: needData.details
+    };
+
+    const { error } = await supabase
+      .from('individualized_needs')
+      .insert(needRecord);
+
+    if (error) {
+      throw new Error(`Failed to create individualized need: ${error.message}`);
+    }
+  };
+
+  const handleBulkImport = async (importedData: Record<string, unknown>[]) => {
+    setIsProcessing(true);
     setError(null);
-    setShowGuardian2(false);
-    setShowIndividualizedNeeds(false);
+    setSuccess(null);
+
+    try {
+      const results = {
+        successful: 0,
+        failed: 0,
+        errors: [] as string[]
+      };
+
+      for (let i = 0; i < importedData.length; i++) {
+        const row = importedData[i];
+        
+        try {
+          // Transform CSV data to match database schema
+          const transformedData = transformCSVData(row);
+
+          // Validate required fields
+          if (!transformedData.first_name || !transformedData.last_name || !transformedData.email || !transformedData.grade_level) {
+            throw new Error(`Missing required fields in row ${i + 1}`);
+          }
+
+          // Validate email format
+          const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+          if (!emailRegex.test(String(transformedData.email))) {
+            throw new Error(`Invalid email format in row ${i + 1}: ${transformedData.email}`);
+          }
+
+          // Check for duplicate email in database
+          const { data: existingUser } = await supabase
+            .from('users')
+            .select('id')
+            .eq('email', transformedData.email)
+            .single();
+
+          if (existingUser) {
+            throw new Error(`User with email ${transformedData.email} already exists`);
+          }
+
+          // Check for duplicate school_student_id if provided
+          if (transformedData.school_student_id) {
+            const { data: existingStudent } = await supabase
+              .from('students')
+              .select('student_id')
+              .eq('school_student_id', transformedData.school_student_id)
+              .single();
+
+            if (existingStudent) {
+              throw new Error(`Student with ID ${transformedData.school_student_id} already exists`);
+            }
+          }
+
+          // Create user record first
+          const userId = await createUserRecord(transformedData);
+
+          // Create student record
+          await createStudentRecord(userId, transformedData);
+
+          // Create individualized needs if applicable
+          if (transformedData.has_iep) {
+            await createIndividualizedNeed(userId, {
+              type: 'Special Education',
+              details: {
+                status: transformedData.spec_ed_status || 'Active',
+                spec_ed_status: transformedData.spec_ed_status,
+                spec_ed: transformedData.spec_ed,
+                home_language: transformedData.home_language,
+                has_active_iep: transformedData.has_active_iep,
+                ell_active: transformedData.ell_active,
+                additional_notes: transformedData.individualized_notes
+              }
+            });
+          }
+
+          if (transformedData.is_economically_disadvantaged) {
+            await createIndividualizedNeed(userId, {
+              type: 'Economically Disadvantaged',
+              details: {
+                status: 'Active',
+                additional_notes: transformedData.individualized_notes
+              }
+            });
+          }
+
+          results.successful++;
+
+        } catch (err) {
+          const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+          results.errors.push(`Row ${i + 1}: ${errorMessage}`);
+          results.failed++;
+        }
+      }
+
+      // Update local state with successful imports
+      if (results.successful > 0) {
+        // Refresh data from database to get the latest records
+        await refreshStudentData();
+        
+        setSuccess(`Successfully imported ${results.successful} students. ${results.failed > 0 ? `${results.failed} failed.` : ''}`);
+      }
+
+      if (results.failed > 0) {
+        setError(`${results.failed} records failed to import:\n${results.errors.slice(0, 5).join('\n')}${results.errors.length > 5 ? '\n...and more' : ''}`);
+      }
+
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Unknown error occurred';
+      setError(`Bulk import failed: ${errorMessage}`);
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
-  const removeStudent = (index: number) => {
-    const studentToRemove = cachedStudentData[index];
-    const newStudents = [...cachedStudentData];
-    newStudents.splice(index, 1);
-    
-    // Also remove any individualized needs for this student
-    const newNeeds = cachedNeedsData.filter(need => {
-      const student = cachedStudentData.find(s => s.student_id === need.student_id);
-      return student !== studentToRemove;
-    });
-    
-    onStudentsUpdate(newStudents);
-    onNeedsUpdate(newNeeds);
-    setCachedStudentData(newStudents);
-    setCachedNeedsData(newNeeds);
+  const refreshStudentData = async () => {
+    try {
+      // Fetch students from database
+      const { data: students, error: studentsError } = await supabase
+        .from('students')
+        .select(`
+          *,
+          users!inner(email, phone, street_address, city, state, zip)
+        `)
+        .eq('school_id', schoolId);
+
+      if (studentsError) throw studentsError;
+
+      // Fetch individualized needs
+      const { data: needs, error: needsError } = await supabase
+        .from('individualized_needs')
+        .select('*')
+        .in('student_id', students?.map(s => s.student_id) || []);
+
+      if (needsError) throw needsError;
+
+      // Transform database records to component format
+      const transformedStudents: Student[] = (students || []).map(student => ({
+        student_id: student.student_id,
+        school_student_id: student.school_student_id,
+        first_name: student.first_name,
+        last_name: student.last_name,
+        email: student.users.email,
+        user_type: 'student' as const,
+        dob: student.dob,
+        enrollment_date: student.enrollment_date,
+        graduation_year: student.graduation_year,
+        current_gpa: student.current_gpa,
+        academic_status: student.academic_status,
+        grade_level: student.grade_level,
+        gender: student.gender,
+        ethnicity: student.ethnicity,
+        state_id: student.state_id,
+        street_address: student.users.street_address,
+        city: student.users.city,
+        state: student.users.state,
+        zip: student.users.zip,
+        phone: student.users.phone,
+        guardian1_name: student.guardian1_name,
+        guardian1_email: student.guardian1_email,
+        guardian1_relationship: student.guardian1_relationship,
+        guardian2_name: student.guardian2_name,
+        guardian2_email: student.guardian2_email,
+        guardian2_relationship: student.guardian2_relationship,
+        has_iep: (needs || []).some(n => n.student_id === student.student_id && n.type === 'Special Education'),
+        is_economically_disadvantaged: (needs || []).some(n => n.student_id === student.student_id && n.type === 'Economically Disadvantaged'),
+        individualized_notes: student.special_needs?.notes
+      }));
+
+      const transformedNeeds: IndividualizedNeed[] = (needs || []).map(need => ({
+        need_id: need.need_id,
+        student_id: need.student_id,
+        type: need.type,
+        details: need.details
+      }));
+
+      onStudentsUpdate(transformedStudents);
+      onNeedsUpdate(transformedNeeds);
+      setCachedStudentData(transformedStudents);
+      setCachedNeedsData(transformedNeeds);
+
+    } catch (err) {
+      console.error('Failed to refresh student data:', err);
+    }
   };
+
+  const onSubmit = async (formData: StudentFormData) => {
+    setIsProcessing(true);
+    setError(null);
+    setSuccess(null);
+
+    try {
+      // Validate email format
+      const emailRegex = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+      if (!emailRegex.test(formData.email)) {
+        throw new Error('Invalid email format');
+      }
+
+      // Check for duplicate email in database
+      const { data: existingUser } = await supabase
+        .from('users')
+        .select('id')
+        .eq('email', formData.email)
+        .single();
+
+      if (existingUser) {
+        throw new Error('A user with this email already exists');
+      }
+
+      // Check for duplicate school student ID if provided
+      if (formData.school_student_id) {
+        const { data: existingStudent } = await supabase
+          .from('students')
+          .select('student_id')
+          .eq('school_student_id', formData.school_student_id)
+          .single();
+
+        if (existingStudent) {
+          throw new Error('A student with this school ID already exists');
+        }
+      }
+
+      // Validate guardian email formats if provided
+      if (formData.guardian1_email && !emailRegex.test(formData.guardian1_email)) {
+        throw new Error('Invalid guardian 1 email format');
+      }
+      if (formData.guardian2_email && !emailRegex.test(formData.guardian2_email)) {
+        throw new Error('Invalid guardian 2 email format');
+      }
+
+      // Create user record
+      const userId = await createUserRecord(formData);
+
+      // Create student record
+      await createStudentRecord(userId, formData);
+
+      // Create individualized needs if applicable
+      if (formData.has_iep) {
+        await createIndividualizedNeed(userId, {
+          type: 'Special Education',
+          details: {
+            status: formData.spec_ed_status,
+            spec_ed_status: formData.spec_ed_status,
+            spec_ed: formData.spec_ed,
+            home_language: formData.home_language,
+            has_active_iep: formData.has_active_iep,
+            ell_active: formData.ell_active,
+            additional_notes: formData.individualized_notes
+          }
+        });
+      }
+
+      if (formData.is_economically_disadvantaged) {
+        await createIndividualizedNeed(userId, {
+          type: 'Economically Disadvantaged',
+          details: {
+            status: 'Active',
+            additional_notes: formData.individualized_notes
+          }
+        });
+      }
+
+      // Refresh data from database
+      await refreshStudentData();
+      
+      reset({
+        enrollment_date: new Date().toISOString().split('T')[0],
+        academic_status: 'active',
+        grade_level: 'Ungraded',
+        home_language: 'English'
+      });
+      
+      setSuccess('Student created successfully');
+      setShowGuardian2(false);
+      setShowIndividualizedNeeds(false);
+
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Unknown error occurred';
+      setError(errorMessage);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const removeStudent = async (index: number) => {
+    const studentToRemove = cachedStudentData[index];
+    
+    try {
+      // Delete from database
+      const { error: studentError } = await supabase
+        .from('students')
+        .delete()
+        .eq('student_id', studentToRemove.student_id);
+
+      if (studentError) throw studentError;
+
+      const { error: userError } = await supabase
+        .from('users')
+        .delete()
+        .eq('id', studentToRemove.student_id);
+
+      if (userError) throw userError;
+
+      // Update local state
+      const newStudents = [...cachedStudentData];
+      newStudents.splice(index, 1);
+      
+      const newNeeds = cachedNeedsData.filter(need => need.student_id !== studentToRemove.student_id);
+      
+      onStudentsUpdate(newStudents);
+      onNeedsUpdate(newNeeds);
+      setCachedStudentData(newStudents);
+      setCachedNeedsData(newNeeds);
+
+      setSuccess('Student removed successfully');
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Failed to remove student';
+      setError(errorMessage);
+    }
+  };
+
+  // Load existing data on component mount
+  React.useEffect(() => {
+    if (schoolId) {
+      refreshStudentData();
+    }
+  }, [schoolId]);
 
   return (
     <div className="space-y-6">
@@ -392,100 +645,113 @@ export default function CombinedStudentsStep({ studentData, needsData, onStudent
           <div>
             <h3 className="text-sm font-medium text-blue-800 mb-2">Step Overview</h3>
             <p className="text-sm text-blue-700">
-              This combined step allows you to add students and their individualized needs in one form.
-              The system will automatically create appropriate records for students with IEP or Economically Disadvantaged status.
+              This step allows you to add students and their individualized needs. Data will be saved directly to Supabase.
+              The system will automatically create user accounts and student records based on your CSV file.
             </p>
           </div>
         </div>
       </div>
 
-      {/* Field Requirements Info */}
+      {/* CSV Format Information */}
       <div className="bg-white rounded-lg border border-gray-200 p-6">
-        <h3 className="text-sm font-medium text-gray-900 mb-4">Field Requirements</h3>
+        <h3 className="text-sm font-medium text-gray-900 mb-4">CSV Format Requirements</h3>
         <div className="grid grid-cols-2 gap-6">
           <div>
             <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center gap-2">
               <span className="w-2 h-2 bg-red-500 rounded-full"></span>
-              Required Fields
+              Required CSV Columns
             </h4>
             <ul className="space-y-1 text-sm text-gray-600">
-              <li>• First Name</li>
-              <li>• Last Name</li>
-              <li>• Email</li>
-              <li>• Grade Level</li>
-              <li>• Academic Status</li>
+              <li>• <strong>Student ID</strong> - School student identifier</li>
+              <li>• <strong>Last Name</strong> - Student's last name</li>
+              <li>• <strong>First Name</strong> - Student's first name</li>
+              <li>• <strong>Student Email</strong> - Student's email address</li>
+              <li>• <strong>Grade</strong> - Grade level (KF=KG, 01=1, etc.)</li>
             </ul>
           </div>
           <div>
             <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center gap-2">
               <span className="w-2 h-2 bg-gray-300 rounded-full"></span>
-              Optional Fields
+              Optional CSV Columns
             </h4>
             <ul className="space-y-1 text-sm text-gray-600">
-              <li>• School Student ID</li>
-              <li>• State ID</li>
-              <li>• Date of Birth</li>
-              <li>• Gender</li>
-              <li>• Ethnicity</li>
-              <li>• Guardian Information</li>
-              <li>• Current GPA</li>
-              <li>• Graduation Year</li>
-              <li>• IEP Status</li>
-              <li>• Economically Disadvantaged Status</li>
-              <li>• Individualized Needs Details</li>
+              <li>• <strong>Address 1</strong> - Street address</li>
+              <li>• <strong>City</strong> - City</li>
+              <li>• <strong>State</strong> - State</li>
+              <li>• <strong>Zip</strong> - ZIP code</li>
+              <li>• <strong>Gender</strong> - M/F</li>
+              <li>• <strong>Enrollment</strong> - ACTIVE/INACTIVE</li>
+              <li>• <strong>Guardian 1 Email Address</strong> - Primary guardian email</li>
+              <li>• <strong>Guardian 2 Email Address</strong> - Secondary guardian email</li>
             </ul>
           </div>
         </div>
       </div>
 
+      {/* Status Messages */}
+      {success && (
+        <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+          <div className="flex items-center gap-2">
+            <CheckCircle className="h-5 w-5 text-green-500 flex-shrink-0" />
+            <p className="text-sm text-green-700">{success}</p>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="h-5 w-5 text-red-500 flex-shrink-0" />
+            <div>
+              <h4 className="text-sm font-medium text-red-800">Error</h4>
+              <p className="text-sm text-red-700 mt-1 whitespace-pre-line">{error}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Bulk Import Section */}
       <div className="bg-white rounded-lg border border-gray-200 p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-medium text-gray-900">Bulk Import Students</h3>
+          {isProcessing && (
+            <div className="flex items-center gap-2 text-indigo-600">
+              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-indigo-600"></div>
+              <span className="text-sm">Processing...</span>
+            </div>
+          )}
+        </div>
+        
         <BulkImport
           onImport={handleBulkImport}
           requiredFields={['first_name', 'last_name', 'email', 'grade_level']}
           multiple={true}
           template={{
-            school_student_id: 'S123',
-            first_name: 'John',
-            last_name: 'Doe',
-            email: 'john.doe@example.com',
-            grade_level: 'KG',
-            academic_status: 'active',
-            dob: '2010-01-01',
-            gender: 'M',
-            ethnicity: 'Not specified',
-            state_id: 'ST123',
-            street_address: '123 Main St',
-            city: 'Anytown',
-            state: 'NJ',
-            zip: '07005',
-            phone: '555-123-4567',
-            guardian1_name: 'Jane Doe',
-            guardian1_email: 'jane.doe@example.com',
-            guardian1_relationship: 'Mother',
-            guardian2_name: 'John Doe Sr',
-            guardian2_email: 'john.sr@example.com',
-            guardian2_relationship: 'Father',
-            has_iep: 'No',
-            is_economically_disadvantaged: 'No',
-            spec_ed_status: 'Active',
-            spec_ed: 'Learning Disability',
-            home_language: 'English',
-            has_active_iep: 'false',
-            ell_active: 'false',
-            individualized_notes: 'Student requires extended time for assessments'
+            'Student ID': 'S123',
+            'Last Name': 'Doe',
+            'First Name': 'John',
+            'Student Email': 'john.doe@example.com',
+            'Grade': 'KG',
+            'Address 1': '123 Main St',
+            'City': 'Anytown',
+            'State': 'NJ',
+            'Zip': '07005',
+            'Gender': 'M',
+            'Enrollment': 'ACTIVE',
+            'Guardian 1 Email Address': 'jane.doe@example.com',
+            'Guardian 2 Email Address': 'john.sr@example.com'
           }}
-          description="Upload a CSV or Excel file containing student information and individualized needs. Required fields are marked with an asterisk (*). Email and School Student ID must be unique if provided."
+          description="Upload a CSV file with student information. The system will automatically create user accounts and student records in Supabase. Required columns: Student ID, Last Name, First Name, Student Email, Grade. The file will be processed and saved directly to the database."
         />
       </div>
 
-      {/* List of added students with their needs */}
+      {/* List of students from database */}
       {cachedStudentData.length > 0 && (
         <div className="space-y-4">
-          <h3 className="text-sm font-medium text-gray-700">Added Students with Individualized Needs</h3>
+          <h3 className="text-sm font-medium text-gray-700">Students in Database ({cachedStudentData.length})</h3>
           <div className="bg-gray-50 rounded-lg divide-y divide-gray-200">
             {cachedStudentData.map((student, index) => (
-              <div key={index} className="p-4 flex items-center justify-between">
+              <div key={student.student_id} className="p-4 flex items-center justify-between">
                 <div className="flex-1">
                   <div className="flex items-center gap-4">
                     <div>
@@ -507,13 +773,13 @@ export default function CombinedStudentsStep({ studentData, needsData, onStudent
                           <GraduationCap className="h-4 w-4" />
                           Grade: {student.grade_level}
                         </div>
-                        {student.has_iep || student.is_economically_disadvantaged ? (
+                        {(student.has_iep || student.is_economically_disadvantaged) && (
                           <div className="flex items-center gap-1">
                             <Heart className="h-4 w-4 text-indigo-500" />
                             Needs: {student.has_iep && 'IEP'} {student.has_iep && student.is_economically_disadvantaged && '+ '} 
                             {student.is_economically_disadvantaged && 'Economically Disadvantaged'}
                           </div>
-                        ) : null}
+                        )}
                       </div>
                     </div>
                   </div>
@@ -521,7 +787,8 @@ export default function CombinedStudentsStep({ studentData, needsData, onStudent
                 <button
                   type="button"
                   onClick={() => removeStudent(index)}
-                  className="p-2 text-gray-400 hover:text-red-600 rounded-full hover:bg-gray-100"
+                  disabled={isProcessing}
+                  className="p-2 text-gray-400 hover:text-red-600 rounded-full hover:bg-gray-100 disabled:opacity-50"
                 >
                   <Trash2 className="h-5 w-5" />
                 </button>
@@ -533,7 +800,7 @@ export default function CombinedStudentsStep({ studentData, needsData, onStudent
 
       {/* Add new student form with individualized needs */}
       <div className="bg-white rounded-lg border border-gray-200 p-6">
-        <h3 className="text-sm font-medium text-gray-700 mb-4">Add Student with Individualized Needs</h3>
+        <h3 className="text-sm font-medium text-gray-700 mb-4">Add Individual Student</h3>
         <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
           {/* Basic Information */}
           <div className="space-y-4">
@@ -1016,20 +1283,23 @@ export default function CombinedStudentsStep({ studentData, needsData, onStudent
             )}
           </div>
 
-          {error && (
-            <div className="p-4 bg-red-50 rounded-md flex items-center gap-2">
-              <AlertCircle className="h-5 w-5 text-red-500 flex-shrink-0" />
-              <p className="text-sm text-red-600 whitespace-pre-line">{error}</p>
-            </div>
-          )}
-
           <div className="flex justify-end">
             <button
               type="submit"
-              className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+              disabled={isProcessing}
+              className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              <Plus className="h-4 w-4 mr-2" />
-              Add Student with Needs
+              {isProcessing ? (
+                <>
+                  <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+                  Creating...
+                </>
+              ) : (
+                <>
+                  <Plus className="h-4 w-4 mr-2" />
+                  Add Student
+                </>
+              )}
             </button>
           </div>
         </form>

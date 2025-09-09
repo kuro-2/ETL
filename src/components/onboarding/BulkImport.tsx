@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
-import { findBestColumnMatches } from '../../utils/columnMatcher';
+import { findBestColumnMatches, normalizeColumnName } from '../../utils/columnMatcher';
 import FileUploader from './bulk-import/FileUploader';
 import ColumnMapper from './bulk-import/ColumnMapper';
 import DataPreview from './bulk-import/DataPreview';
